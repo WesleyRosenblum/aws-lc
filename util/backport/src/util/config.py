@@ -179,10 +179,14 @@ RUN_FILE = TOOL_ROOT / ".backport-runs" / "last-run.json"
 
 
 def save_run(
-    fix: str, base: str, branches: Sequence[str], verdicts: Dict[str, str]
+    fix: str,
+    base: str,
+    branches: Sequence[str],
+    verdicts: Dict[str, str],
+    decided_by: Optional[Dict[str, str]] = None,
 ) -> None:
     """
-    Saves what analyze decided, for apply to pick up
+    Saves what analyze decided, for apply and publish to pick up
 
     The file it writes:
         generated_at  when this ran, shown by apply so a stale run is obvious
@@ -190,6 +194,7 @@ def save_run(
         base          what the fix was compared against
         branches      every release branch that was looked at
         verdicts      one of the four verdicts per branch, the part apply acts on
+        decided_by    what settled each branch, quoted in the pull request body
     """
     RUN_FILE.parent.mkdir(parents=True, exist_ok=True)
     RUN_FILE.write_text(
@@ -200,6 +205,7 @@ def save_run(
                 "base": base,
                 "branches": list(branches),
                 "verdicts": verdicts,
+                "decided_by": decided_by or {},
             },
             indent=2,
         )

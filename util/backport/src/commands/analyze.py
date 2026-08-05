@@ -53,5 +53,5 @@ def cmd_analyze(args) -> int:
     verdicts, decided_by = refine_with_ai(fix_sha, src_files, bug_commits, verdicts)
 
     print_summary(fix_sha, files, bug_commits, verdicts, decided_by)
-    save_run(fix_sha, base, branches, verdicts)
+    save_run(fix_sha, base, branches, verdicts, decided_by)
     return 0

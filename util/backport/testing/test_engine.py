@@ -23,7 +23,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from commands import apply as apply_cmd
 from engine import classify_branches, consult_ai, discover_branches, inspect_fix
-from util import config, git
+from commands import publish
+from util import config, git, github
 
 import main
 
@@ -1323,6 +1324,194 @@ class ReadmeMatchesTheCode(unittest.TestCase):
             shipped - listed, set(), "these ship but are not in the README listing"
         )
         self.assertEqual(listed - shipped, set(), "these are listed but do not exist")
+
+
+class FakeWorktreeRoot:
+    """Stands in for WORKTREE_ROOT, so a test can say whether the worktree is there"""
+
+    def __init__(self, present: bool) -> None:
+        self.present = present
+
+    def __truediv__(self, name):
+        return mock.Mock(exists=lambda: self.present)
+
+
+class RemoteSlug(unittest.TestCase):
+    # The push target decides whether a PR head needs an owner prefix, so reading a
+    # remote URL wrong sends the pull request at the wrong repo
+
+    def slug(self, url):
+        with mock.patch.object(
+            github, "git", lambda *a, **k: completed(stdout=url + "\n")
+        ):
+            return github.remote_slug("origin")
+
+    def test_https_with_git_suffix(self):
+        self.assertEqual(
+            self.slug("https://github.com/tianyiy-tim/aws-lc.git"), "tianyiy-tim/aws-lc"
+        )
+
+    def test_https_without_suffix(self):
+        self.assertEqual(self.slug("https://github.com/aws/aws-lc"), "aws/aws-lc")
+
+    def test_ssh_form(self):
+        self.assertEqual(self.slug("git@github.com:aws/aws-lc.git"), "aws/aws-lc")
+
+    def test_a_url_we_cannot_parse_is_none(self):
+        self.assertIsNone(self.slug("/some/local/path"))
+
+    def test_a_missing_remote_is_none(self):
+        with mock.patch.object(
+            github, "git", lambda *a, **k: completed(returncode=2, stdout="")
+        ):
+            self.assertIsNone(github.remote_slug("nope"))
+
+
+class RequirePushRemote(unittest.TestCase):
+    # Pushing backport branches at aws/aws-lc would put half-reviewed work on the real
+    # repository, so it is refused outright rather than just discouraged
+
+    def test_pushing_to_aws_lc_is_refused(self):
+        with mock.patch.object(
+            github, "remote_slug", lambda r: "aws/aws-lc"
+        ), self.assertRaises(config.BackportError) as caught:
+            github.require_push_remote("upstream")
+        self.assertIn("aws/aws-lc", str(caught.exception))
+
+    def test_the_check_ignores_case(self):
+        with mock.patch.object(
+            github, "remote_slug", lambda r: "AWS/AWS-LC"
+        ), self.assertRaises(config.BackportError):
+            github.require_push_remote("upstream")
+
+    def test_a_fork_is_allowed(self):
+        with mock.patch.object(github, "remote_slug", lambda r: "tianyiy-tim/aws-lc"):
+            self.assertEqual(github.require_push_remote("origin"), "tianyiy-tim/aws-lc")
+
+    def test_an_unknown_remote_is_an_error(self):
+        with mock.patch.object(
+            github, "remote_slug", lambda r: None
+        ), self.assertRaises(config.BackportError):
+            github.require_push_remote("nope")
+
+
+class HeadSpec(unittest.TestCase):
+    # The one difference between a laptop pushing to a fork and CI pushing to the repo
+    # it already runs in
+
+    def test_across_repos_the_owner_is_prefixed(self):
+        got = github.head_spec("tianyiy-tim/aws-lc", "aws/aws-lc", "backport-x")
+        self.assertEqual(got, "tianyiy-tim:backport-x")
+
+    def test_within_one_repo_the_branch_stands_alone(self):
+        got = github.head_spec("aws/aws-lc", "aws/aws-lc", "backport-x")
+        self.assertEqual(got, "backport-x")
+
+
+class PrBody(unittest.TestCase):
+    def test_the_body_says_it_is_not_auto_merged(self):
+        title, body = github.pr_title_and_body(
+            "fips-2024-09-27", "abc1234567890", "Fix a thing", "git history", "3301"
+        )
+        self.assertEqual(title, "[backport fips-2024-09-27] Fix a thing")
+        self.assertIn("#3301", body)
+        self.assertIn("Not** auto-merged", body)
+
+    def test_without_a_source_pr_there_is_no_dangling_link(self):
+        _, body = github.pr_title_and_body(
+            "fips-2024-09-27", "abc1234567890", "Fix a thing", "", None
+        )
+        self.assertNotIn("of #", body)
+
+
+class BranchState(unittest.TestCase):
+    # A branch is only publishable once its cherry-pick is finished. Resolving a
+    # conflict by hand has to be enough, without apply running again
+
+    def state(self, exists=True, worktree=False, in_progress=False, ahead=1):
+        """branch_state with git and the worktree directory faked out"""
+        with mock.patch.multiple(
+            publish,
+            WORKTREE_ROOT=FakeWorktreeRoot(worktree),
+            branch_exists=lambda name: exists,
+            cherry_pick_in_progress=lambda path: in_progress,
+            commits_ahead=lambda base, branch: ahead,
+        ):
+            return publish.branch_state("fips-2024-09-27", "backport-x")
+
+    def test_no_branch_is_missing(self):
+        self.assertEqual(self.state(exists=False), publish.MISSING)
+
+    def test_a_stopped_cherry_pick_is_unfinished(self):
+        got = self.state(worktree=True, in_progress=True)
+        self.assertEqual(got, publish.UNFINISHED)
+
+    def test_a_resolved_conflict_is_ready(self):
+        # The worktree survives a hand resolution, so its presence alone means nothing
+        got = self.state(worktree=True, in_progress=False)
+        self.assertEqual(got, publish.OPENED)
+
+    def test_a_clean_pick_with_no_worktree_is_ready(self):
+        self.assertEqual(self.state(worktree=False), publish.OPENED)
+
+    def test_a_branch_with_no_commits_of_its_own_is_missing(self):
+        self.assertEqual(self.state(ahead=0), publish.MISSING)
+
+
+class PublishBranch(unittest.TestCase):
+    def publish(self, state, existing=None, dry_run=False, push_error=None, url="ok"):
+        with mock.patch.multiple(
+            publish,
+            branch_state=lambda release, local_branch: state,
+            existing_pr=lambda repo, head: existing,
+            push_branch=lambda remote, branch: push_error,
+            create_pr=lambda *a: url,
+            remove_worktree=lambda path: None,
+        ):
+            return publish.publish_branch(
+                "fips-2024-09-27",
+                "abc1234567890",
+                "subject",
+                "basis",
+                None,
+                "origin",
+                "me/aws-lc",
+                "aws/aws-lc",
+                dry_run,
+            )
+
+    def test_a_missing_branch_says_run_apply(self):
+        outcome, detail = self.publish(publish.MISSING)
+        self.assertEqual(outcome, publish.MISSING)
+        self.assertIn("apply", detail)
+
+    def test_an_unfinished_branch_is_never_pushed(self):
+        outcome, _ = self.publish(publish.UNFINISHED)
+        self.assertEqual(outcome, publish.UNFINISHED)
+
+    def test_an_existing_pull_request_is_not_opened_twice(self):
+        outcome, detail = self.publish(publish.OPENED, existing="http://pr/1")
+        self.assertEqual(outcome, publish.ALREADY_OPEN)
+        self.assertEqual(detail, "http://pr/1")
+
+    def test_a_dry_run_pushes_nothing(self):
+        outcome, _ = self.publish(publish.OPENED, dry_run=True)
+        self.assertEqual(outcome, publish.DRY_RUN)
+
+    def test_a_failed_push_is_reported_not_raised(self):
+        outcome, detail = self.publish(publish.OPENED, push_error="denied")
+        self.assertEqual(outcome, publish.FAILED)
+        self.assertIn("denied", detail)
+
+    def test_a_failed_pr_is_reported(self):
+        outcome, detail = self.publish(publish.OPENED, url="error: no base")
+        self.assertEqual(outcome, publish.FAILED)
+        self.assertIn("no base", detail)
+
+    def test_a_good_run_returns_the_url(self):
+        outcome, detail = self.publish(publish.OPENED, url="http://pr/9")
+        self.assertEqual(outcome, publish.OPENED)
+        self.assertEqual(detail, "http://pr/9")
 
 
 if __name__ == "__main__":
