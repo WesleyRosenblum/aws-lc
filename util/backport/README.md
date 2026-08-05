@@ -202,6 +202,7 @@ util/backport/backport apply --open-pr
 | `--pr` | source pull request number, linked in each body and given a summary comment |
 | `--remote` | fork remote the branches are pushed to, `origin` by default |
 | `--dry-run` | print what would be pushed and opened, touch nothing |
+| `--push-to-aws-lc` | let branches be pushed to `aws/aws-lc`. For CI only |
 | `--yes` | skip the confirm, for scripts and CI |
 
 Branches go to your fork; the pull requests are opened against `aws/aws-lc`. Pushing
@@ -236,6 +237,44 @@ Go ahead? [Y/N] y
 Nothing is ever a draft and nothing is auto-merged. Re-running is safe: a branch that
 already has a pull request is left alone, and finishing a conflict by hand is enough
 to let the next run pick it up, with no need to run `apply` again.
+
+## Running In CI
+
+`.github/workflows/backport-bot.yml` does the same three steps automatically. It fires
+when a pull request labelled `needs-backport` merges, so the decision to backport stays
+with the reviewers rather than with the tool.
+
+It runs as two jobs, which is the point rather than an accident:
+
+| Job | Can reach the model | Can write to the repo |
+| --- | --- | --- |
+| `analyze` | yes, `id-token: write` for Bedrock | no, `contents: read` |
+| `publish` | no | yes, `contents: write` and `pull-requests: write` |
+
+The model reads repository content, so the job that reads it is never the job holding a
+token that could change it. The verdict travels between them as an artifact.
+
+Branches are pushed to `aws/aws-lc` itself, because in CI the checkout already is
+`aws/aws-lc`. That needs `--push-to-aws-lc`, which is refused everywhere else,
+and `push_branch` will only ever push a `backport-` branch, so the escape cannot reach
+anything else.
+
+The workflow assumes `AwsLcGitHubActionsBackportOidcRole`, which the OIDC stack pins to
+this exact workflow file by `job_workflow_ref`. Renaming the file breaks the trust
+policy until the CDK stack is redeployed. That role is the only thing allowed to chain
+into the shared `AwsLcGitHubActionsBedrockRole`, alongside autofix's own OIDC role.
+
+### Before the bot can run
+
+Two things have to be true first, and neither is settled by merging this code.
+
+The role has to exist. CDK takes the role name from the construct id, so
+`tests/ci/cdk` has to be deployed before the workflow can assume it. Until then the
+`analyze` job fails at the credentials step.
+
+A pull request opened with `GITHUB_TOKEN` does not start any workflow, so the backport
+pull requests arrive with no CI of their own. Getting them tested needs a token that is
+not `GITHUB_TOKEN`, which is a decision about secrets rather than about this tool.
 
 ## Configuration
 
@@ -329,6 +368,10 @@ util/backport/
 └── .backport-runs/               # the last analyze result, not checked in
     .backport-worktrees/          # where a conflicted pick waits, not checked in
 ```
+
+The CI half lives outside this folder, in
+`.github/workflows/backport-bot.yml` and
+`tests/ci/cdk/cdk/aws_lc_github_oidc_stack.py`.
 
 ## Testing
 

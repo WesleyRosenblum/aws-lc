@@ -1514,5 +1514,55 @@ class PublishBranch(unittest.TestCase):
         self.assertEqual(detail, "http://pr/9")
 
 
+class CanonicalPushEscape(unittest.TestCase):
+    # CI runs inside aws/aws-lc, so the branches have nowhere else to go. That escape
+    # has to be explicit, and it must not weaken the local refusal
+
+    def test_ci_may_push_to_aws_lc(self):
+        with mock.patch.object(github, "remote_slug", lambda r: "aws/aws-lc"):
+            got = github.require_push_remote("origin", allow_aws_lc=True)
+        self.assertEqual(got, "aws/aws-lc")
+
+    def test_the_refusal_still_stands_by_default(self):
+        with mock.patch.object(
+            github, "remote_slug", lambda r: "aws/aws-lc"
+        ), self.assertRaises(config.BackportError):
+            github.require_push_remote("origin")
+
+    def test_a_missing_remote_is_still_an_error_even_for_ci(self):
+        with mock.patch.object(
+            github, "remote_slug", lambda r: None
+        ), self.assertRaises(config.BackportError):
+            github.require_push_remote("nope", allow_aws_lc=True)
+
+
+class PushOnlyBackportBranches(unittest.TestCase):
+    # The escape above means a bug here could push anything to the real repository, so
+    # the branch name is checked too. Two independent limits, not one
+
+    def test_a_backport_branch_is_pushed(self):
+        seen = []
+        with mock.patch.object(
+            github, "git", lambda *a, **k: seen.append(a) or completed()
+        ):
+            self.assertIsNone(
+                github.push_branch("origin", "backport-fips-2024-09-27-abc")
+            )
+        self.assertTrue(seen)
+
+    def test_anything_else_is_refused_before_git_runs(self):
+        with mock.patch.object(github, "git", never_called):
+            for branch in ("main", "fips-2024-09-27", "my-feature"):
+                with self.assertRaises(config.BackportError):
+                    github.push_branch("origin", branch)
+
+    def test_a_failed_push_comes_back_as_text(self):
+        with mock.patch.object(
+            github, "git", lambda *a, **k: completed(returncode=1, stdout="denied")
+        ):
+            got = github.push_branch("origin", "backport-x")
+        self.assertIn("denied", got)
+
+
 if __name__ == "__main__":
     unittest.main()
